@@ -1,0 +1,13 @@
+metric,value
+riders_rows,34421
+drivers_rows,4719
+riders_status_counts,"{'dropped-off': 34117, 'abandoned': 279, 'dropoff-scheduled': 17, 'pickup-scheduled': 8}"
+riders_missing_pickup_time,279
+riders_missing_dropoff_time,287
+riders_bad_coords_pickup,0
+riders_bad_coords_dropoff,0
+riders_bad_time_order,0
+drivers_status_counts,"{'offline-scheduled': 2605, 'offline': 2073, 'busy': 21, 'available': 20}"
+drivers_bad_coords_initial,0
+drivers_bad_coords_current,0
+drivers_bad_time_order,0

@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar  3 03:30:14 2026
+
+@author: zhaoyiheng
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Baseline Simulation with Robustness Check (v1: Constant Rate, v2: Time-varying Rate)
+"""
+
+import simpy
+import pandas as pd
+import numpy as np
+import math
+from scipy import stats
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+def mean_ci_halfwidth(x, alpha=0.05):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < 2:
+        return float(np.mean(x)) if n == 1 else 0.0, np.nan
+    m = float(np.mean(x))
+    s = float(np.std(x, ddof=1))
+    tcrit = stats.t.ppf(1 - alpha/2, df=n-1)
+    half = tcrit * s / math.sqrt(n)
+    return m, half
+
+def estimate_lambda_15min(datetimes: pd.Series) -> np.ndarray:
+    """Estimate empirical arrival rates per hour for 96 15-minute bins."""
+    dt = pd.to_datetime(datetimes, errors='coerce').dropna()
+    if len(dt) == 0:
+        return np.ones(96) * 1.0 
+    bins = dt.dt.hour * 4 + (dt.dt.minute // 15)
+    counts = bins.value_counts().reindex(range(96), fill_value=0).sort_index().to_numpy()
+    n_days = max(dt.dt.date.nunique(), 1)
+    mean_count_per_bin = counts / n_days
+    rate_per_hour = mean_count_per_bin * 4.0
+    return rate_per_hour
+
+
+BASELINE_MODE = "v2"        
+
+SPEED_MPH = 20.0             
+RIDER_ARRIVAL_RATE = 30.0    
+DRIVER_LOGIN_RATE = 3.0      
+PATIENCE_RATE = 2.0          
+
+BASE_FARE = 3.0              
+PER_MILE_FARE = 2.0          
+DRIVER_COST_PER_MILE = 0.20  
+
+SIM_HOURS = 24.0             
+WARMUP_HOURS = 2.0 
+N_REPS = 30 if BASELINE_MODE == "v1" else 10 # v2作为稳健性检验跑10次即可
+SEED0 = 12345            
+
+def calc_distance(x1, y1, x2, y2):
+    return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+class BoxCarSim:
+    def __init__(self, env, riders_pool, online_hours_pool, lam_r_bins=None, lam_d_bins=None):
+        self.env = env
+        self.riders_pool = riders_pool
+        self.online_hours_pool = online_hours_pool
+        
+        self.lam_r_bins = lam_r_bins
+        self.lam_d_bins = lam_d_bins
+        
+        self.idle_drivers = {}     
+        self.busy_drivers = set()  
+        self.waiting_queue = []    
+        
+        self.stats = {
+            'wait_times': [],
+            'requests': 0,           
+            'cancelled_trips': 0,
+            'completed_trips': 0,
+            'total_online_time': 0,
+            'total_busy_time': 0,
+            'total_profit': 0.0      
+        }
+        
+        self.env.process(self.generate_riders())
+        self.env.process(self.generate_drivers())
+        self.next_driver_id = 1
+
+    def current_bin(self):
+        """获取当前时间对应的 15-min bin index (0~95)"""
+        hour = int(self.env.now) % 24
+        minute = int((self.env.now - int(self.env.now)) * 60)
+        return hour * 4 + (minute // 15)
+
+    def get_rider_rate(self):
+        if self.lam_r_bins is None:
+            return RIDER_ARRIVAL_RATE
+        return max(float(self.lam_r_bins[self.current_bin()]), 1e-6)
+
+    def get_driver_rate(self):
+        if self.lam_d_bins is None:
+            return DRIVER_LOGIN_RATE
+        return max(float(self.lam_d_bins[self.current_bin()]), 1e-6)
+
+    def generate_riders(self):
+        while True:
+            rate = self.get_rider_rate()
+            yield self.env.timeout(np.random.exponential(1.0 / rate))
+            
+            sample = self.riders_pool.sample(1).iloc[0]
+            rider = {
+                'arr_time': self.env.now,
+                'px': sample['pickup_x'],
+                'py': sample['pickup_y'],
+                'dx': sample['dropoff_x'],
+                'dy': sample['dropoff_y'],
+                'trip_hours': sample['trip_hours']
+            }
+            
+            if self.env.now > WARMUP_HOURS:
+                self.stats['requests'] += 1
+                
+            self.waiting_queue.append(rider)
+            self.env.process(self.rider_patience_countdown(rider))
+            self.dispatch()
+
+    def rider_patience_countdown(self, rider):
+        patience = np.random.exponential(1.0 / PATIENCE_RATE)
+        yield self.env.timeout(patience)
+        
+        if rider in self.waiting_queue:
+            self.waiting_queue.remove(rider)
+            if self.env.now > WARMUP_HOURS:
+                self.stats['cancelled_trips'] += 1
+
+    def generate_drivers(self):
+        while True:
+            rate = self.get_driver_rate()
+            yield self.env.timeout(np.random.exponential(1.0 / rate))
+            
+            online_duration = np.random.choice(self.online_hours_pool)
+            sample = self.riders_pool.sample(1).iloc[0]
+            
+            driver_id = self.next_driver_id
+            self.next_driver_id += 1
+            
+            self.idle_drivers[driver_id] = {
+                'x': sample['pickup_x'],
+                'y': sample['pickup_y'],
+                'logout_time': self.env.now + online_duration,
+                'total_busy': 0,
+                'total_profit': 0.0, 
+                'login_time': self.env.now
+            }
+            self.dispatch()
+            self.env.process(self.monitor_driver_logout(driver_id, online_duration))
+
+    def monitor_driver_logout(self, driver_id, online_duration):
+        yield self.env.timeout(online_duration)
+        if driver_id in self.idle_drivers:
+            if self.env.now > WARMUP_HOURS:
+                d_info = self.idle_drivers[driver_id]
+                self.stats['total_online_time'] += (self.env.now - max(d_info['login_time'], WARMUP_HOURS))
+                self.stats['total_busy_time'] += d_info['total_busy']
+                self.stats['total_profit'] += d_info['total_profit']
+            del self.idle_drivers[driver_id]
+
+    def dispatch(self):
+        riders_to_remove = []
+        for rider in self.waiting_queue:
+            if not self.idle_drivers:
+                break 
+            
+            best_driver = None
+            min_dist = float('inf')
+            
+            for did, d_info in self.idle_drivers.items():
+                if self.env.now >= d_info['logout_time']:
+                    continue
+                dist = calc_distance(d_info['x'], d_info['y'], rider['px'], rider['py'])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_driver = did
+                    
+            if best_driver is not None:
+                riders_to_remove.append(rider)
+                d_info = self.idle_drivers.pop(best_driver) 
+                rider['match_time'] = self.env.now
+                self.env.process(self.serve_trip(best_driver, d_info, rider, min_dist))
+                
+        for r in riders_to_remove:
+            self.waiting_queue.remove(r)
+
+    def serve_trip(self, driver_id, d_info, rider, pickup_dist):
+        self.busy_drivers.add(driver_id)
+        
+        pickup_time = pickup_dist / SPEED_MPH
+        total_service_time = pickup_time + rider['trip_hours']
+        
+        trip_dist = calc_distance(rider['px'], rider['py'], rider['dx'], rider['dy'])
+        fare = BASE_FARE + PER_MILE_FARE * trip_dist
+        cost = DRIVER_COST_PER_MILE * (pickup_dist + trip_dist)
+        profit = fare - cost
+        
+        yield self.env.timeout(total_service_time)
+        self.busy_drivers.remove(driver_id)
+        
+        if self.env.now > WARMUP_HOURS:
+            wait_time_minutes = (rider['match_time'] - rider['arr_time']) * 60
+            self.stats['wait_times'].append(wait_time_minutes)
+            self.stats['completed_trips'] += 1
+            d_info['total_busy'] += total_service_time
+            d_info['total_profit'] += profit
+        
+        d_info['x'] = rider['dx']
+        d_info['y'] = rider['dy']
+        
+        if self.env.now < d_info['logout_time']:
+            self.idle_drivers[driver_id] = d_info
+            self.dispatch()
+        else:
+            if self.env.now > WARMUP_HOURS:
+                self.stats['total_online_time'] += (self.env.now - max(d_info['login_time'], WARMUP_HOURS))
+                self.stats['total_busy_time'] += d_info['total_busy']
+                self.stats['total_profit'] += d_info['total_profit']
+
+
+def run_experiments(n_reps=N_REPS):
+    df_riders = pd.read_csv('riders_clean.csv')
+    valid_riders = df_riders[df_riders['status_group'] == 'completed'].dropna(
+        subset=['pickup_x', 'pickup_y', 'dropoff_x', 'dropoff_y', 'trip_hours']
+    )
+    df_drivers = pd.read_csv('drivers_clean.csv')
+    valid_online_hours = df_drivers['online_hours'].dropna().values
+
+    # 提取时间分布 (仅在 v2 模式下计算)
+    if BASELINE_MODE == "v2":
+        print("Calibrating time-varying rates (15-min bins) from empirical data...")
+        # 注意：这里假设时间列名为 request_datetime 和 arrival_datetime，若不同请直接修改下面两行
+        lam_r_bins = estimate_lambda_15min(df_riders['request_datetime'])
+        lam_d_bins = estimate_lambda_15min(df_drivers['arrival_datetime'])
+    else:
+        lam_r_bins = None
+        lam_d_bins = None
+
+    results = {'wait_med': [], 'wait_p95': [], 'util': [], 'cancel_rate': [], 'profit_per_hr': []}
+    all_waits = []
+
+    for i in range(n_reps):
+        np.random.seed(SEED0 + i)
+        env = simpy.Environment()
+        sim = BoxCarSim(env, valid_riders, valid_online_hours, lam_r_bins=lam_r_bins, lam_d_bins=lam_d_bins)
+        env.run(until=SIM_HOURS)
+
+        waits = sim.stats['wait_times']
+        all_waits.extend(waits)
+        results['wait_med'].append(np.median(waits) if len(waits) else 0.0)
+        results['wait_p95'].append(np.percentile(waits, 95) if len(waits) else 0.0)
+
+        reqs = sim.stats['requests']
+        results['cancel_rate'].append((sim.stats['cancelled_trips'] / reqs * 100.0) if reqs > 0 else 0.0)
+
+        ot = sim.stats['total_online_time']
+        results['util'].append((sim.stats['total_busy_time'] / ot * 100.0) if ot > 0 else 0.0)
+        results['profit_per_hr'].append((sim.stats['total_profit'] / ot) if ot > 0 else 0.0)
+
+
+    rep_df = pd.DataFrame(results)
+    rep_df.to_csv(f"baseline_{BASELINE_MODE}_replications_R{n_reps}.csv", index=False)
+    
+
+    m_can, h_can = mean_ci_halfwidth(results['cancel_rate'])
+    m_med, h_med = mean_ci_halfwidth(results['wait_med'])
+    m_p95, h_p95 = mean_ci_halfwidth(results['wait_p95'])
+    m_util, h_util = mean_ci_halfwidth(results['util'])
+    m_pph, h_pph = mean_ci_halfwidth(results['profit_per_hr'])
+
+    print("\n" + "="*45)
+    print(f"🎯 BASELINE {BASELINE_MODE.upper()} KPI SCORECARD (Post Warm-up)  |  R={n_reps}")
+    print("="*45)
+    print(f"Cancellation Rate: {m_can:.2f}% (95% CI: [{m_can-h_can:.2f}, {m_can+h_can:.2f}])")
+    print(f"Median Wait Time:  {m_med:.2f} mins (95% CI: [{m_med-h_med:.2f}, {m_med+h_med:.2f}])")
+    print(f"95th Pct Wait:     {m_p95:.2f} mins (95% CI: [{m_p95-h_p95:.2f}, {m_p95+h_p95:.2f}])")
+    print(f"Driver Util:       {m_util:.1f}% (95% CI: [{m_util-h_util:.1f}, {m_util+h_util:.1f}])")
+    print(f"Profit per Hour:   £{m_pph:.2f}/hr (95% CI: [£{m_pph-h_pph:.2f}, £{m_pph+h_pph:.2f}])")
+
+
+    plot_baseline_results(all_waits, n_reps)
+
+def plot_baseline_results(all_waits, n_reps):
+    """生成报告所需的图表：Figure 7 (CCDF)"""
+    if not all_waits:
+        print("No wait times to plot.")
+        return
+
+    # 1. 准备数据：计算 CCDF
+    sorted_waits = np.sort(all_waits)
+    ccdf = 1.0 - np.arange(len(sorted_waits)) / len(sorted_waits)
+    
+    p95_val = np.percentile(sorted_waits, 95)
+    median_val = np.median(sorted_waits)
+
+    # 2. 绘图：Figure 7 (CCDF)
+    plt.figure(figsize=(10, 6))
+    plt.step(sorted_waits, ccdf, where='post', color='#1f77b4', linewidth=2)
+    
+    # 设置对数坐标 (Log scale) 符合学术要求
+    plt.yscale('log')
+    plt.grid(True, which="both", ls="-", alpha=0.3)
+    
+    # 绘制 P95 辅助线
+    plt.axvline(p95_val, color='r', linestyle='--', alpha=0.7)
+    plt.axhline(0.05, color='gray', linestyle=':', alpha=0.7)
+    
+    # 添加标注框
+    plt.text(p95_val * 1.05, 0.06, f'P95 = {p95_val:.2f} min', color='r', fontweight='bold')
+    plt.annotate(f'Median = {median_val:.2f} min', xy=(median_val, 0.5), xytext=(median_val*3, 0.7),
+                 arrowprops=dict(arrowstyle='->', color='black'))
+
+    plt.title(f'Baseline {BASELINE_MODE.upper()} Waiting-Time Tail (CCDF, R={n_reps})', fontsize=14)
+    plt.xlabel('Waiting time (minutes)', fontsize=12)
+    plt.ylabel('Tail probability P(wait > w)', fontsize=12)
+    plt.xlim(0, max(sorted_waits) * 1.1)
+    
+    filename = f"fig_wait_tail_ccdf_baseline_{BASELINE_MODE}_R{n_reps}.png"
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"✅ Figure saved: {filename}")
+    
+if __name__ == "__main__":
+    run_experiments(n_reps=N_REPS)
