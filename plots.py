@@ -14,40 +14,34 @@ import matplotlib
 matplotlib.use("Agg")
 plt.style.use('seaborn-v0_8-whitegrid')
 
-# ==========================================
-# 核心修改：使用最新的 Baseline v2 仿真数据
-# ==========================================
 labels = ['Baseline v2\n(Time-Varying)', 'Policy A\n(Radius Cap)', 'Policy B\n(Spatio-Temporal)']
 
-# 数据来源：Table 8 
-cancel_rates = [7.79, 41.83, 15.70]      # 取消率 (%)
-wait_95th = [16.20, 18.98, 20.03]        # 95分位等待时间 (min)
-utilization = [72.4, 45.7, 89.4]         # 司机利用率 (%)
-profit_hr = [17.53, 14.70, 21.34]        # 每小时利润 (£)
+
+cancel_rates = [7.79, 41.83, 15.70]      
+wait_95th = [16.20, 18.98, 20.03]        
+utilization = [72.4, 45.7, 89.4]         
+profit_hr = [17.53, 14.70, 21.34]        
 
 x = np.arange(len(labels))
 width = 0.35
 
-# ==========================================
-# 图 1: Rider Outcomes (乘客体验)
-# ==========================================
+
 fig, ax1 = plt.subplots(figsize=(8, 5))
 
-color1 = '#e74c3c' # 红色：取消率
-color2 = '#f39c12' # 橙色：等待时间
+color1 = '#e74c3c' 
+color2 = '#f39c12' 
 
 rects1 = ax1.bar(x - width/2, cancel_rates, width, label='Cancellation Rate (%)', color=color1, alpha=0.8)
 ax1.set_ylabel('Cancellation Rate (%)', fontweight='bold')
 ax1.set_xticks(x)
 ax1.set_xticklabels(labels, fontweight='bold')
-ax1.set_ylim(0, 50) # 足够容纳 Policy A 的 41.83%
-
+ax1.set_ylim(0, 50)
 ax2 = ax1.twinx()
 rects2 = ax2.bar(x + width/2, wait_95th, width, label='95th Pct Wait (mins)', color=color2, alpha=0.8)
 ax2.set_ylabel('95th Percentile Wait (mins)', fontweight='bold')
-ax2.set_ylim(0, 25) # 提高上限到 25，以容纳 Policy B 的 20.03m
+ax2.set_ylim(0, 25) 
 
-# 图例和标签
+
 lines1, labels1 = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
 ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
@@ -66,13 +60,11 @@ fig.tight_layout()
 plt.savefig('fig_rider_outcomes.png', dpi=300)
 plt.close()
 
-# ==========================================
-# 图 2: Driver Outcomes (司机收益)
-# ==========================================
+
 fig, ax1 = plt.subplots(figsize=(8, 5))
 
-color3 = '#2980b9' # 蓝色：利用率
-color4 = '#27ae60' # 绿色：利润
+color3 = '#2980b9' 
+color4 = '#27ae60' 
 
 rects3 = ax1.bar(x - width/2, utilization, width, label='Driver Utilization (%)', color=color3, alpha=0.8)
 ax1.set_ylabel('Utilization (%)', fontweight='bold')
@@ -83,7 +75,7 @@ ax1.set_ylim(0, 100)
 ax2 = ax1.twinx()
 rects4 = ax2.bar(x + width/2, profit_hr, width, label='Profit per Hour (£)', color=color4, alpha=0.8)
 ax2.set_ylabel('Profit per Hour (£)', fontweight='bold')
-ax2.set_ylim(0, 25) # 容纳 Policy B 的 £21.34
+ax2.set_ylim(0, 25) 
 
 lines3, labels3 = ax1.get_legend_handles_labels()
 lines4, labels4 = ax2.get_legend_handles_labels()
