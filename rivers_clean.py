@@ -10,9 +10,7 @@ import pandas as pd
 import numpy as np
 import math
 
-# ==========================================
-# 0. 全局参数设置 (可根据你的报告基准调参)
-# ==========================================
+
 SPEED_MPH = 20.0             # 车辆平均速度 20 mph
 RIDER_ARRIVAL_RATE = 30.0    # 乘客到达率 (每小时 30 单) - 后续可替换为 piecewise rate
 DRIVER_LOGIN_RATE = 3.0      # 司机上线率 (每小时 3 人) - 后续可替换为 piecewise rate
